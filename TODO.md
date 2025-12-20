@@ -1,16 +1,12 @@
-# TODO: Fix Detection Data in Admin Database
+# Attendance System Fixes TODO
 
-## Tasks
-- [x] Update init_database method to add 'date' column to the attendance table
-- [x] Modify save_to_database method to save date and time separately
-- [x] Update open_admin method to include "Date" column in the treeview and adjust column widths
-- [x] Add a "REFRESH" button in the admin panel to reload data from the database
-- [x] Add a search bar in the admin panel to filter records by name (last name or first name)
-- [x] Optimize camera initialization and detection performance to reduce lag
+## Pending Tasks
 
-## Followup Steps
-- [x] Test the application to ensure detection data saves with date and time
-- [x] Verify that the admin panel displays separate Date and Time columns
-- [x] Confirm that the REFRESH button updates the table with latest data
-- [x] Test the search bar functionality to filter records as you type
-- [x] Test camera opening and ensure reduced lag in live detection
+## Completed Tasks
+- [x] Change face detector backend from 'opencv' to 'retinaface' in main.py (face_recognition_worker and recognize_student_with_embeddings)
+- [x] Change face detector backend from 'opencv' to 'retinaface' in generate_embeddings.py
+- [x] Lower uniform detection confidence from 70% to 50% in main.py (detection_worker)
+- [x] Increase minimum size filter for uniform predictions from 30x30 to 50x50 pixels in main.py
+- [x] Increase face recognition threshold from 0.7 to 1.0 in main.py
+- [x] Regenerate embeddings using updated generate_embeddings.py
+- [x] Test the changes for improved accuracy
