@@ -1,0 +1,14 @@
+path: C:\Users\Aron\Downloads\attendance\uniform_detection
+train: images/train
+val: images/val
+
+nc: 8
+names:
+  0: white_polo
+  1: brown_pants
+  2: brown_dress
+  3: ribbon 
+  4: belt
+  5: socks
+  6: school_id
+  7: black_shoes

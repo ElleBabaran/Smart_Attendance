@@ -1,0 +1,8 @@
+white_polo
+brown_pants
+brown_dress
+ribbon
+belt
+socks
+school_id
+black_shoes
