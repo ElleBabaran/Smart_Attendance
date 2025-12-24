@@ -41,25 +41,30 @@ class AttendanceSystem:
         self.UNIFORM_CONFIDENCE = 0.25
         self.FACE_EMBEDDINGS_PATH = "face_embeddings.pkl"
         self.FACE_THRESHOLD = 10
-        self.PROCESS_EVERY_N_FRAMES = 10  # Increased from 5 to 10 for better performance
+        self.RECOGNITION_EVERY_N_FRAMES = 15  # Face recognition is expensive
         
         # Detection variables
         self.face_embeddings = {}
         self.face_cascade = None
         self.uniform_model = None
         self.frame_count = 0
-        self.last_face_detections = []
+        
+        # Separate tracking for detection (fast) vs recognition (slow)
+        self.current_face_boxes = []  # Updated every frame - just boxes
+        self.recognized_faces = {}  # Maps box location to name - updated periodically
         self.face_threshold = self.FACE_THRESHOLD
         
         # Attendance tracking
         self.logged_today = set()
         self.last_logged_time = {}
-        self.cooldown_seconds = 300
+        self.cooldown_seconds = 10  # Changed to 10 seconds cooldown
         
         # Performance optimization
-        self.detection_thread = None
-        self.detection_queue = []
-        self.processing = False
+        self.recognition_in_progress = False
+        
+        # Uniform accumulation for consistent detection
+        self.uniform_accumulator = {}  # {name: {part: count}}
+        self.accumulation_frames = 30  # Collect data over 30 frames (~1 second)
 
         # Database initialization
         self.init_database()
@@ -158,6 +163,34 @@ class AttendanceSystem:
         
         threading.Thread(target=play, daemon=True).start()
     
+    def boxes_overlap(self, box1, box2, threshold=0.5):
+        """Check if two bounding boxes overlap significantly"""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # Calculate intersection
+        x_left = max(x1, x2)
+        y_top = max(y1, y2)
+        x_right = min(x1 + w1, x2 + w2)
+        y_bottom = min(y1 + h1, y2 + h2)
+        
+        if x_right < x_left or y_bottom < y_top:
+            return False
+        
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        
+        iou = intersection_area / min(box1_area, box2_area)
+        return iou > threshold
+    
+    def get_face_name_for_box(self, box):
+        """Get the recognized name for a face box"""
+        for recognized_box, name in self.recognized_faces.items():
+            if self.boxes_overlap(box, recognized_box, threshold=0.4):
+                return name
+        return "Detecting..."
+    
     def log_attendance(self, name, uniform_parts):
         """Log attendance to database with cooldown"""
         try:
@@ -171,6 +204,35 @@ class AttendanceSystem:
                     return False
             
             detected_parts = [p.lower() for p in uniform_parts.keys()]
+            
+            # Check if no uniform parts detected at all
+            if not detected_parts or len(detected_parts) == 0:
+                uniform_status = "Not Detected"
+                missing_items = "No uniform parts detected"
+                
+                hour = current_time.hour
+                minute = current_time.minute
+                
+                # On Time: 4:00 AM to 7:15 AM
+                # Tardy: 7:16 AM to 7:30 AM
+                # Late: After 7:30 AM or before 4:00 AM
+                if (hour >= 4 and hour < 7) or (hour == 7 and minute <= 15):
+                    status = "On Time"
+                elif hour == 7 and 16 <= minute <= 30:
+                    status = "Tardy"
+                else:
+                    status = "Late"
+                
+                self.cursor.execute('''INSERT INTO attendance 
+                    (full_name, uniform_status, missing_items, time, status, date)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (name, uniform_status, missing_items, current_time_str, status, current_date))
+                self.conn.commit()
+                
+                self.last_logged_time[name] = current_time
+                self.play_success_sound()
+                
+                return True
             
             female_indicators = ["ribbon", "dress", "brown dress", "belt"]
             male_indicators = ["white polo", "polo", "brown pants", "pants"]
@@ -218,7 +280,10 @@ class AttendanceSystem:
             hour = current_time.hour
             minute = current_time.minute
             
-            if hour < 7 or (hour == 7 and minute <= 15):
+            # On Time: 4:00 AM to 7:15 AM
+            # Tardy: 7:16 AM to 7:30 AM
+            # Late: After 7:30 AM or before 4:00 AM
+            if (hour >= 4 and hour < 7) or (hour == 7 and minute <= 15):
                 status = "On Time"
             elif hour == 7 and 16 <= minute <= 30:
                 status = "Tardy"
@@ -263,32 +328,57 @@ class AttendanceSystem:
                   bg=self.accent_color, fg=self.text_light,
                   width=25, height=2, cursor="hand2", border=0, relief=tk.FLAT, 
                   command=self.open_admin).pack(pady=12)
-        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.1", 
+        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.2", 
                  font=("Segoe UI", 9),
                  bg=self.bg_primary, fg="#666666").pack(side=tk.BOTTOM, pady=20)
 
     def start_camera(self):
+        # Release any existing camera first
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+            cv2.destroyAllWindows()
+        
         self.open_camera_window()
         
         def init_camera():
             try:
+                # Small delay to ensure previous camera is fully released
+                time.sleep(0.3)
+                
                 # Use DSHOW backend for faster camera init on Windows
                 self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
                 if not self.cap.isOpened():
                     self.cap = cv2.VideoCapture(0)  # Fallback
                 
+                if not self.cap.isOpened():
+                    self.root.after(0, lambda: messagebox.showerror("Error", 
+                        "Failed to open camera. Please check if camera is in use."))
+                    return
+                
                 # Optimize camera settings
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for less lag
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # Read test frame to ensure camera is working
+                ret, _ = self.cap.read()
+                if not ret:
+                    self.cap.release()
+                    self.cap = None
+                    self.root.after(0, lambda: messagebox.showerror("Error", 
+                        "Camera opened but failed to read frame."))
+                    return
                 
                 self.camera_active = True
                 self.frame_count = 0
-                self.last_face_detections = []
-                self.root.after(10, self.update_camera)  # Faster update rate
+                self.current_face_boxes = []
+                self.recognized_faces = {}
+                self.uniform_accumulator = {}
+                self.root.after(10, self.update_camera)
             except Exception as e:
-                self.root.after(100, lambda: messagebox.showerror("Error", f"Failed to open camera: {e}"))
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to open camera: {e}"))
         
         threading.Thread(target=init_camera, daemon=True).start()
 
@@ -354,7 +444,7 @@ class AttendanceSystem:
 
     def process_face_recognition(self, frame, faces):
         """Process face recognition in background thread"""
-        current_face_detections = []
+        new_recognized_faces = {}
         
         for (x, y, w, h) in faces:
             pad = 20
@@ -373,42 +463,48 @@ class AttendanceSystem:
                 if result:
                     embedding = result[0]["embedding"]
                     name = self.find_face_match(embedding, self.face_threshold)
-                    current_face_detections.append((x, y, w, h, name))
+                    new_recognized_faces[(x, y, w, h)] = name
             except:
-                current_face_detections.append((x, y, w, h, "Detecting..."))
+                new_recognized_faces[(x, y, w, h)] = "Detecting..."
         
-        return current_face_detections
+        # Update the recognized faces dictionary
+        self.recognized_faces = new_recognized_faces
+        self.recognition_in_progress = False
 
     def update_camera(self):
+        # Check if we should stop
+        if not self.camera_active:
+            return
+        
         try:
-            if not self.camera_active or not self.cap or not self.cap.isOpened():
+            if not self.cap or not self.cap.isOpened():
                 return
             
             ret, frame = self.cap.read()
             if not ret:
-                self.root.after(10, self.update_camera)
+                if self.camera_active:
+                    self.root.after(10, self.update_camera)
                 return
             
             self.frame_count += 1
             
-            # Face recognition (less frequent for performance)
-            if self.frame_count % self.PROCESS_EVERY_N_FRAMES == 0 and self.face_cascade and not self.processing:
+            # Face detection (EVERY FRAME for smooth boxes)
+            if self.face_cascade:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+                self.current_face_boxes = [(x, y, w, h) for (x, y, w, h) in faces]
                 
-                if len(faces) > 0:
-                    self.processing = True
-                    # Process in background thread
-                    def process():
-                        detections = self.process_face_recognition(frame.copy(), faces)
-                        self.last_face_detections = detections
-                        self.processing = False
-                    
-                    threading.Thread(target=process, daemon=True).start()
+                # Face recognition (less frequent - only every N frames)
+                if self.frame_count % self.RECOGNITION_EVERY_N_FRAMES == 0 and len(faces) > 0 and not self.recognition_in_progress:
+                    self.recognition_in_progress = True
+                    threading.Thread(target=self.process_face_recognition, 
+                                   args=(frame.copy(), faces), daemon=True).start()
             
-            # Draw face boxes (fast operation)
-            for detection in self.last_face_detections:
-                x, y, w, h, name = detection
+            # Draw face boxes with names (EVERY FRAME - no lag)
+            for box in self.current_face_boxes:
+                x, y, w, h = box
+                name = self.get_face_name_for_box(box)
+                
                 color = (255, 0, 0) if name != "Unknown" and name != "Detecting..." else (0, 0, 255)
                 cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
                 
@@ -441,25 +537,65 @@ class AttendanceSystem:
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             # Update status
-            num_faces = len(self.last_face_detections)
-            recognized_faces = [d[4] for d in self.last_face_detections if d[4] != "Unknown" and d[4] != "Detecting..."]
+            num_faces = len(self.current_face_boxes)
+            recognized_names = [name for name in self.recognized_faces.values() 
+                              if name != "Unknown" and name != "Detecting..."]
             
-            # Auto-log (in background to avoid blocking)
-            if recognized_faces and uniform_parts:
-                for face_name in recognized_faces:
-                    def log_async(name):
-                        logged = self.log_attendance(name, uniform_parts)
-                        if logged:
-                            self.root.after(0, lambda n=name: self.status_label.config(
-                                text=f"✓ Attendance Logged: {n}", 
-                                fg=self.success
-                            ))
-                    threading.Thread(target=lambda: log_async(face_name), daemon=True).start()
+            # Accumulate uniform parts for recognized faces
+            if recognized_names:
+                for face_name in set(recognized_names):
+                    if face_name not in self.uniform_accumulator:
+                        self.uniform_accumulator[face_name] = {}
+                    
+                    # Add current frame's uniform parts to accumulator
+                    for part, count in uniform_parts.items():
+                        if part not in self.uniform_accumulator[face_name]:
+                            self.uniform_accumulator[face_name][part] = 0
+                        self.uniform_accumulator[face_name][part] += count
+            
+            # Auto-log every 30 frames (about 1 second of accumulation)
+            if self.frame_count % self.accumulation_frames == 0 and recognized_names:
+                for face_name in set(recognized_names):
+                    # Check if person is still in cooldown period
+                    current_time = datetime.now()
+                    can_log = True
+                    
+                    if face_name in self.last_logged_time:
+                        time_diff = (current_time - self.last_logged_time[face_name]).total_seconds()
+                        if time_diff < self.cooldown_seconds:
+                            can_log = False
+                    
+                    # Only proceed if not in cooldown
+                    if can_log and face_name in self.uniform_accumulator:
+                        # Get most consistent uniform parts (appeared in >30% of frames)
+                        accumulated_parts = self.uniform_accumulator[face_name]
+                        threshold = self.accumulation_frames * 0.3  # Must appear in at least 30% of frames
+                        
+                        consistent_parts = {}
+                        for part, count in accumulated_parts.items():
+                            if count >= threshold:
+                                consistent_parts[part] = 1
+                        
+                        # Log with consistent parts
+                        def log_async(name, parts):
+                            logged = self.log_attendance(name, parts)
+                            if logged:
+                                self.root.after(0, lambda n=name: self.status_label.config(
+                                    text=f"✓ Attendance Logged: {n}", 
+                                    fg=self.success
+                                ))
+                        
+                        threading.Thread(target=lambda n=face_name, p=consistent_parts.copy(): log_async(n, p), 
+                                       daemon=True).start()
+                    
+                    # Clear accumulator for this person after checking
+                    if face_name in self.uniform_accumulator:
+                        self.uniform_accumulator[face_name] = {}
             
             if num_faces > 0:
-                if recognized_faces:
+                if recognized_names:
                     self.status_label.config(
-                        text=f"✓ Recognized: {', '.join(recognized_faces)}", 
+                        text=f"✓ Recognized: {', '.join(set(recognized_names))}", 
                         fg=self.success
                     )
                 else:
@@ -488,15 +624,20 @@ class AttendanceSystem:
         except Exception as e:
             pass
         finally:
-            self.root.after(10, self.update_camera)
+            if self.camera_active:
+                self.root.after(10, self.update_camera)
 
     def stop_camera(self):
         self.camera_active = False
-        time.sleep(0.1)
+        self.root.after(200, self._release_camera_and_return)
+
+    def _release_camera_and_return(self):
+        """Release camera resources and return to menu"""
         if self.cap:
             self.cap.release()
             self.cap = None
-        self.show_main_menu()
+        cv2.destroyAllWindows()
+        self.root.after(100, self.show_main_menu)
 
     def increase_threshold(self):
         self.face_threshold += 1
@@ -694,6 +835,7 @@ class AttendanceSystem:
         self.camera_active = False
         if self.cap:
             self.cap.release()
+        cv2.destroyAllWindows()
         self.conn.close()
         self.root.destroy()
 
