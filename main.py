@@ -15,6 +15,7 @@ import numpy as np
 import winsound
 from collections import defaultdict
 import xlsxwriter
+from queue import Queue
 
 class AttendanceSystem:
     def __init__(self, root):
@@ -41,7 +42,7 @@ class AttendanceSystem:
         self.UNIFORM_CONFIDENCE = 0.25
         self.FACE_EMBEDDINGS_PATH = "face_embeddings.pkl"
         self.FACE_THRESHOLD = 10
-        self.RECOGNITION_EVERY_N_FRAMES = 15  # Face recognition is expensive
+        self.RECOGNITION_EVERY_N_FRAMES = 15
         
         # Detection variables
         self.face_embeddings = {}
@@ -50,21 +51,26 @@ class AttendanceSystem:
         self.frame_count = 0
         
         # Separate tracking for detection (fast) vs recognition (slow)
-        self.current_face_boxes = []  # Updated every frame - just boxes
-        self.recognized_faces = {}  # Maps box location to name - updated periodically
+        self.current_face_boxes = []
+        self.recognized_faces = {}
         self.face_threshold = self.FACE_THRESHOLD
         
-        # Attendance tracking
+        # Attendance tracking - OPTIMIZED
         self.logged_today = set()
         self.last_logged_time = {}
-        self.cooldown_seconds = 10  # Changed to 10 seconds cooldown
+        self.cooldown_seconds = 5  # Reduced cooldown for faster testing
         
         # Performance optimization
         self.recognition_in_progress = False
         
-        # Uniform accumulation for consistent detection
-        self.uniform_accumulator = {}  # {name: {part: count}}
-        self.accumulation_frames = 30  # Collect data over 30 frames (~1 second)
+        # Uniform accumulation - OPTIMIZED
+        self.uniform_accumulator = {}
+        self.accumulation_frames = 15  # Reduced from 30 to 15 for faster detection
+        
+        # Database queue for async operations - NEW
+        self.db_queue = Queue()
+        self.db_thread = threading.Thread(target=self.process_db_queue, daemon=True)
+        self.db_thread.start()
 
         # Database initialization
         self.init_database()
@@ -114,7 +120,46 @@ class AttendanceSystem:
                 status TEXT NOT NULL, 
                 date TEXT NOT NULL)''')
         
+        # Add index for faster queries - OPTIMIZATION
+        self.cursor.execute('''CREATE INDEX IF NOT EXISTS idx_full_name ON attendance(full_name)''')
+        self.cursor.execute('''CREATE INDEX IF NOT EXISTS idx_date ON attendance(date)''')
+        
         self.conn.commit()
+
+    def process_db_queue(self):
+        """Background thread to process database operations asynchronously"""
+        while True:
+            try:
+                operation = self.db_queue.get()
+                if operation is None:
+                    break
+                
+                action, data = operation
+                
+                if action == "INSERT":
+                    name, uniform_status, missing_items, time_str, status, date = data
+                    conn = sqlite3.connect('attendance.db')
+                    cursor = conn.cursor()
+                    cursor.execute('''INSERT INTO attendance 
+                        (full_name, uniform_status, missing_items, time, status, date)
+                        VALUES (?, ?, ?, ?, ?, ?)''',
+                        (name, uniform_status, missing_items, time_str, status, date))
+                    conn.commit()
+                    conn.close()
+                    
+                    # Update UI on main thread
+                    self.root.after(0, lambda n=name: self.status_label.config(
+                        text=f"✓ Attendance Logged: {n}", 
+                        fg=self.success
+                    ))
+                    
+                    # Play sound
+                    self.play_success_sound()
+                
+                self.db_queue.task_done()
+                
+            except Exception as e:
+                print(f"DB Queue Error: {e}")
 
     def load_models(self):
         """Load face recognition and uniform detection models"""
@@ -168,7 +213,6 @@ class AttendanceSystem:
         x1, y1, w1, h1 = box1
         x2, y2, w2, h2 = box2
         
-        # Calculate intersection
         x_left = max(x1, x2)
         y_top = max(y1, y2)
         x_right = min(x1 + w1, x2 + w2)
@@ -192,12 +236,13 @@ class AttendanceSystem:
         return "Detecting..."
     
     def log_attendance(self, name, uniform_parts):
-        """Log attendance to database with cooldown"""
+        """Log attendance to database with cooldown - OPTIMIZED VERSION"""
         try:
             current_time = datetime.now()
             current_date = current_time.strftime("%B %d, %Y")
             current_time_str = current_time.strftime("%I:%M %p")
             
+            # Quick cooldown check
             if name in self.last_logged_time:
                 time_diff = (current_time - self.last_logged_time[name]).total_seconds()
                 if time_diff < self.cooldown_seconds:
@@ -205,41 +250,59 @@ class AttendanceSystem:
             
             detected_parts = [p.lower() for p in uniform_parts.keys()]
             
-            # Check if no uniform parts detected at all
+            # Determine time status first (common for all cases)
+            hour = current_time.hour
+            minute = current_time.minute
+            
+            if (hour >= 4 and hour < 7) or (hour == 7 and minute <= 15):
+                status = "On Time"
+            elif hour == 7 and 16 <= minute <= 30:
+                status = "Tardy"
+            else:
+                status = "Late"
+            
+            # Case 1: No uniform parts detected
             if not detected_parts or len(detected_parts) == 0:
                 uniform_status = "Not Detected"
                 missing_items = "No uniform parts detected"
                 
-                hour = current_time.hour
-                minute = current_time.minute
-                
-                # On Time: 4:00 AM to 7:15 AM
-                # Tardy: 7:16 AM to 7:30 AM
-                # Late: After 7:30 AM or before 4:00 AM
-                if (hour >= 4 and hour < 7) or (hour == 7 and minute <= 15):
-                    status = "On Time"
-                elif hour == 7 and 16 <= minute <= 30:
-                    status = "Tardy"
-                else:
-                    status = "Late"
-                
-                self.cursor.execute('''INSERT INTO attendance 
-                    (full_name, uniform_status, missing_items, time, status, date)
-                    VALUES (?, ?, ?, ?, ?, ?)''',
-                    (name, uniform_status, missing_items, current_time_str, status, current_date))
-                self.conn.commit()
-                
+                # Add to queue instead of direct insert
+                self.db_queue.put(("INSERT", (name, uniform_status, missing_items, 
+                                              current_time_str, status, current_date)))
                 self.last_logged_time[name] = current_time
-                self.play_success_sound()
-                
                 return True
             
-            female_indicators = ["ribbon", "dress", "brown dress", "belt"]
-            male_indicators = ["white polo", "polo", "brown pants", "pants"]
+            # Case 2: Determine gender and check uniform
+            # Define indicators with more specific patterns
+            female_indicators = ["ribbon", "dress", "brown_dress"]
+            male_indicators = ["white_polo", "polo", "brown_pants", "pants", "pant"]
             
-            is_female = any(indicator in detected_parts for indicator in female_indicators)
-            is_male = any(indicator in detected_parts for indicator in male_indicators)
+            # Check for distinctive items first (highest priority)
+            has_ribbon = any("ribbon" in part for part in detected_parts)
+            has_polo = any("polo" in part for part in detected_parts)
+            has_dress = any("dress" in part for part in detected_parts)
+            has_pants = any("pants" in part or "pant" in part for part in detected_parts)
             
+            # Determine gender based on distinctive items
+            if has_ribbon or has_dress:
+                is_female = True
+            elif has_polo or has_pants:
+                is_female = False
+            else:
+                # Count indicators as fallback
+                female_count = sum(1 for indicator in female_indicators 
+                                  if any(indicator in part or part in indicator for part in detected_parts))
+                male_count = sum(1 for indicator in male_indicators 
+                                if any(indicator in part or part in indicator for part in detected_parts))
+                
+                if female_count > male_count:
+                    is_female = True
+                elif male_count > female_count:
+                    is_female = False
+                else:
+                    return False  # Cannot determine gender
+            
+            # Set required parts based on gender
             if is_female:
                 required_parts = {
                     "ribbon": ["ribbon"],
@@ -249,27 +312,28 @@ class AttendanceSystem:
                     "socks": ["socks"],
                     "belt": ["belt"]
                 }
-            elif is_male:
+            else:
                 required_parts = {
                     "white polo": ["polo", "white polo", "white_polo"],
-                    "brown pants": ["pants", "brown pants", "brown_pants"],
+                    "brown pants": ["pants", "brown pants", "brown_pants", "pant"],
                     "socks": ["socks"],
                     "black shoes": ["black_shoes", "shoes", "black shoes"],
                     "school id": ["school_id", "id", "school id"]
                 }
-            else:
-                return False
             
+            # Check for missing parts
             missing_parts = []
             for item_name, variations in required_parts.items():
                 found = False
                 for variation in variations:
-                    if any(variation in detected or detected in variation for detected in detected_parts):
+                    if any(variation in detected or detected in variation 
+                           for detected in detected_parts):
                         found = True
                         break
                 if not found:
                     missing_parts.append(item_name)
             
+            # Set uniform status
             if missing_parts:
                 uniform_status = "Incomplete"
                 missing_items = ", ".join(missing_parts)
@@ -277,31 +341,15 @@ class AttendanceSystem:
                 uniform_status = "Complete"
                 missing_items = "None"
             
-            hour = current_time.hour
-            minute = current_time.minute
-            
-            # On Time: 4:00 AM to 7:15 AM
-            # Tardy: 7:16 AM to 7:30 AM
-            # Late: After 7:30 AM or before 4:00 AM
-            if (hour >= 4 and hour < 7) or (hour == 7 and minute <= 15):
-                status = "On Time"
-            elif hour == 7 and 16 <= minute <= 30:
-                status = "Tardy"
-            else:
-                status = "Late"
-            
-            self.cursor.execute('''INSERT INTO attendance 
-                (full_name, uniform_status, missing_items, time, status, date)
-                VALUES (?, ?, ?, ?, ?, ?)''',
-                (name, uniform_status, missing_items, current_time_str, status, current_date))
-            self.conn.commit()
+            # Add to queue instead of direct insert - OPTIMIZATION
+            self.db_queue.put(("INSERT", (name, uniform_status, missing_items, 
+                                          current_time_str, status, current_date)))
             
             self.last_logged_time[name] = current_time
-            self.play_success_sound()
-            
             return True
             
-        except:
+        except Exception as e:
+            print(f"Error logging attendance: {e}")
             return False
 
     def show_main_menu(self):
@@ -328,12 +376,11 @@ class AttendanceSystem:
                   bg=self.accent_color, fg=self.text_light,
                   width=25, height=2, cursor="hand2", border=0, relief=tk.FLAT, 
                   command=self.open_admin).pack(pady=12)
-        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.2", 
+        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.3", 
                  font=("Segoe UI", 9),
                  bg=self.bg_primary, fg="#666666").pack(side=tk.BOTTOM, pady=20)
 
     def start_camera(self):
-        # Release any existing camera first
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -343,26 +390,22 @@ class AttendanceSystem:
         
         def init_camera():
             try:
-                # Small delay to ensure previous camera is fully released
                 time.sleep(0.3)
                 
-                # Use DSHOW backend for faster camera init on Windows
                 self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
                 if not self.cap.isOpened():
-                    self.cap = cv2.VideoCapture(0)  # Fallback
+                    self.cap = cv2.VideoCapture(0)
                 
                 if not self.cap.isOpened():
                     self.root.after(0, lambda: messagebox.showerror("Error", 
                         "Failed to open camera. Please check if camera is in use."))
                     return
                 
-                # Optimize camera settings
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 
-                # Read test frame to ensure camera is working
                 ret, _ = self.cap.read()
                 if not ret:
                     self.cap.release()
@@ -467,12 +510,10 @@ class AttendanceSystem:
             except:
                 new_recognized_faces[(x, y, w, h)] = "Detecting..."
         
-        # Update the recognized faces dictionary
         self.recognized_faces = new_recognized_faces
         self.recognition_in_progress = False
 
     def update_camera(self):
-        # Check if we should stop
         if not self.camera_active:
             return
         
@@ -488,19 +529,19 @@ class AttendanceSystem:
             
             self.frame_count += 1
             
-            # Face detection (EVERY FRAME for smooth boxes)
+            # Face detection (EVERY FRAME)
             if self.face_cascade:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
                 self.current_face_boxes = [(x, y, w, h) for (x, y, w, h) in faces]
                 
-                # Face recognition (less frequent - only every N frames)
+                # Face recognition (less frequent)
                 if self.frame_count % self.RECOGNITION_EVERY_N_FRAMES == 0 and len(faces) > 0 and not self.recognition_in_progress:
                     self.recognition_in_progress = True
                     threading.Thread(target=self.process_face_recognition, 
                                    args=(frame.copy(), faces), daemon=True).start()
             
-            # Draw face boxes with names (EVERY FRAME - no lag)
+            # Draw face boxes
             for box in self.current_face_boxes:
                 x, y, w, h = box
                 name = self.get_face_name_for_box(box)
@@ -513,7 +554,7 @@ class AttendanceSystem:
                 cv2.putText(frame, name, (x+5, y-10), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Uniform detection (every frame for smooth boxes)
+            # Uniform detection
             uniform_parts = {}
             if self.uniform_model:
                 uniform_results = self.uniform_model(frame, conf=self.UNIFORM_CONFIDENCE, verbose=False)
@@ -541,22 +582,20 @@ class AttendanceSystem:
             recognized_names = [name for name in self.recognized_faces.values() 
                               if name != "Unknown" and name != "Detecting..."]
             
-            # Accumulate uniform parts for recognized faces
+            # Accumulate uniform parts
             if recognized_names:
                 for face_name in set(recognized_names):
                     if face_name not in self.uniform_accumulator:
                         self.uniform_accumulator[face_name] = {}
                     
-                    # Add current frame's uniform parts to accumulator
                     for part, count in uniform_parts.items():
                         if part not in self.uniform_accumulator[face_name]:
                             self.uniform_accumulator[face_name][part] = 0
                         self.uniform_accumulator[face_name][part] += count
             
-            # Auto-log every 30 frames (about 1 second of accumulation)
+            # Auto-log (optimized - every 15 frames instead of 30)
             if self.frame_count % self.accumulation_frames == 0 and recognized_names:
                 for face_name in set(recognized_names):
-                    # Check if person is still in cooldown period
                     current_time = datetime.now()
                     can_log = True
                     
@@ -565,33 +604,24 @@ class AttendanceSystem:
                         if time_diff < self.cooldown_seconds:
                             can_log = False
                     
-                    # Only proceed if not in cooldown
                     if can_log and face_name in self.uniform_accumulator:
-                        # Get most consistent uniform parts (appeared in >30% of frames)
                         accumulated_parts = self.uniform_accumulator[face_name]
-                        threshold = self.accumulation_frames * 0.3  # Must appear in at least 30% of frames
+                        threshold = self.accumulation_frames * 0.3
                         
                         consistent_parts = {}
                         for part, count in accumulated_parts.items():
                             if count >= threshold:
                                 consistent_parts[part] = 1
                         
-                        # Log with consistent parts
-                        def log_async(name, parts):
-                            logged = self.log_attendance(name, parts)
-                            if logged:
-                                self.root.after(0, lambda n=name: self.status_label.config(
-                                    text=f"✓ Attendance Logged: {n}", 
-                                    fg=self.success
-                                ))
-                        
-                        threading.Thread(target=lambda n=face_name, p=consistent_parts.copy(): log_async(n, p), 
+                        # Log asynchronously
+                        threading.Thread(target=self.log_attendance, 
+                                       args=(face_name, consistent_parts.copy()), 
                                        daemon=True).start()
                     
-                    # Clear accumulator for this person after checking
                     if face_name in self.uniform_accumulator:
                         self.uniform_accumulator[face_name] = {}
             
+            # Update UI
             if num_faces > 0:
                 if recognized_names:
                     self.status_label.config(
@@ -615,7 +645,7 @@ class AttendanceSystem:
             else:
                 self.missing_label.config(text="No uniform parts detected", fg=self.warning)
 
-            # Display frame (optimized)
+            # Display frame
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = ImageTk.PhotoImage(image=Image.fromarray(frame_rgb))
             self.camera_label.config(image=img, text="")
@@ -632,7 +662,6 @@ class AttendanceSystem:
         self.root.after(200, self._release_camera_and_return)
 
     def _release_camera_and_return(self):
-        """Release camera resources and return to menu"""
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -836,6 +865,7 @@ class AttendanceSystem:
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
+        self.db_queue.put(None)  # Stop the DB thread
         self.conn.close()
         self.root.destroy()
 
