@@ -42,7 +42,8 @@ class AttendanceSystem:
         self.UNIFORM_CONFIDENCE = 0.25
         self.FACE_EMBEDDINGS_PATH = "face_embeddings.pkl"
         self.FACE_THRESHOLD = 10
-        self.RECOGNITION_EVERY_N_FRAMES = 15
+        self.RECOGNITION_EVERY_N_FRAMES = 30  # Reduced frequency
+        self.UNIFORM_EVERY_N_FRAMES = 3  # Process uniform detection less often
         
         # Detection variables
         self.face_embeddings = {}
@@ -55,22 +56,29 @@ class AttendanceSystem:
         self.recognized_faces = {}
         self.face_threshold = self.FACE_THRESHOLD
         
-        # Attendance tracking - OPTIMIZED
+        # Attendance tracking
         self.logged_today = set()
         self.last_logged_time = {}
-        self.cooldown_seconds = 5  # Reduced cooldown for faster testing
+        self.cooldown_seconds = 5
         
         # Performance optimization
         self.recognition_in_progress = False
+        self.uniform_detection_in_progress = False
         
-        # Uniform accumulation - OPTIMIZED
+        # Uniform accumulation
         self.uniform_accumulator = {}
-        self.accumulation_frames = 15  # Reduced from 30 to 15 for faster detection
+        self.accumulation_frames = 15
+        self.current_uniform_parts = {}  # Cache for display
         
-        # Database queue for async operations - NEW
+        # Database queue for async operations
         self.db_queue = Queue()
         self.db_thread = threading.Thread(target=self.process_db_queue, daemon=True)
         self.db_thread.start()
+        
+        # UI update queue - prevent UI flooding
+        self.ui_update_queue = Queue(maxsize=1)
+        self.last_ui_update = 0
+        self.ui_update_interval = 0.1  # Update UI max 10 times per second
 
         # Database initialization
         self.init_database()
@@ -120,7 +128,7 @@ class AttendanceSystem:
                 status TEXT NOT NULL, 
                 date TEXT NOT NULL)''')
         
-        # Add index for faster queries - OPTIMIZATION
+        # Add index for faster queries
         self.cursor.execute('''CREATE INDEX IF NOT EXISTS idx_full_name ON attendance(full_name)''')
         self.cursor.execute('''CREATE INDEX IF NOT EXISTS idx_date ON attendance(date)''')
         
@@ -147,19 +155,23 @@ class AttendanceSystem:
                     conn.commit()
                     conn.close()
                     
-                    # Update UI on main thread
-                    self.root.after(0, lambda n=name: self.status_label.config(
-                        text=f"✓ Attendance Logged: {n}", 
-                        fg=self.success
-                    ))
+                    # Schedule UI update
+                    self.schedule_ui_update("success", f"✓ Attendance Logged: {name}")
                     
-                    # Play sound
-                    self.play_success_sound()
+                    # Play sound in background
+                    threading.Thread(target=self.play_success_sound, daemon=True).start()
                 
                 self.db_queue.task_done()
                 
             except Exception as e:
                 print(f"DB Queue Error: {e}")
+
+    def schedule_ui_update(self, update_type, message):
+        """Schedule UI update without blocking"""
+        try:
+            self.ui_update_queue.put((update_type, message), block=False)
+        except:
+            pass  # Queue full, skip this update
 
     def load_models(self):
         """Load face recognition and uniform detection models"""
@@ -197,16 +209,43 @@ class AttendanceSystem:
         return "Unknown"
     
     def play_success_sound(self):
-        """Play success sound in background thread"""
-        def play():
-            try:
-                winsound.Beep(1000, 200)
-                time.sleep(0.05)
-                winsound.Beep(1200, 200)
-            except:
-                pass
-        
-        threading.Thread(target=play, daemon=True).start()
+        """Play success sound"""
+        try:
+            winsound.Beep(1000, 200)
+            time.sleep(0.05)
+            winsound.Beep(1200, 200)
+        except:
+            pass
+    
+    def is_brown_color(self, frame, x1, y1, x2, y2):
+        """Check if the detected region is actually brown colored"""
+        try:
+            roi = frame[y1:y2, x1:x2]
+            
+            if roi.size == 0:
+                return False
+            
+            # Downsample for faster processing
+            roi_small = cv2.resize(roi, (50, 50))
+            hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
+            
+            lower_brown1 = np.array([5, 60, 30])
+            upper_brown1 = np.array([20, 255, 180])
+            lower_brown2 = np.array([0, 50, 25])
+            upper_brown2 = np.array([12, 255, 140])
+            
+            mask1 = cv2.inRange(hsv, lower_brown1, upper_brown1)
+            mask2 = cv2.inRange(hsv, lower_brown2, upper_brown2)
+            brown_mask = cv2.bitwise_or(mask1, mask2)
+            
+            brown_pixels = cv2.countNonZero(brown_mask)
+            total_pixels = roi_small.shape[0] * roi_small.shape[1]
+            brown_percentage = (brown_pixels / total_pixels) * 100
+            
+            return brown_percentage >= 40
+            
+        except Exception as e:
+            return False
     
     def boxes_overlap(self, box1, box2, threshold=0.5):
         """Check if two bounding boxes overlap significantly"""
@@ -236,7 +275,7 @@ class AttendanceSystem:
         return "Detecting..."
     
     def log_attendance(self, name, uniform_parts):
-        """Log attendance to database with cooldown - OPTIMIZED VERSION"""
+        """Log attendance to database with cooldown"""
         try:
             current_time = datetime.now()
             current_date = current_time.strftime("%B %d, %Y")
@@ -250,7 +289,7 @@ class AttendanceSystem:
             
             detected_parts = [p.lower() for p in uniform_parts.keys()]
             
-            # Determine time status first (common for all cases)
+            # Determine time status
             hour = current_time.hour
             minute = current_time.minute
             
@@ -266,41 +305,23 @@ class AttendanceSystem:
                 uniform_status = "Not Detected"
                 missing_items = "No uniform parts detected"
                 
-                # Add to queue instead of direct insert
                 self.db_queue.put(("INSERT", (name, uniform_status, missing_items, 
                                               current_time_str, status, current_date)))
                 self.last_logged_time[name] = current_time
                 return True
             
-            # Case 2: Determine gender and check uniform
-            # Define indicators with more specific patterns
-            female_indicators = ["ribbon", "dress", "brown_dress"]
-            male_indicators = ["white_polo", "polo", "brown_pants", "pants", "pant"]
-            
-            # Check for distinctive items first (highest priority)
+            # Case 2: Determine gender
+            has_brown_dress = any(part in ["brown_dress", "brown dress"] for part in detected_parts)
+            has_brown_pants = any(part in ["brown_pants", "brown pants", "brown_pant"] for part in detected_parts)
             has_ribbon = any("ribbon" in part for part in detected_parts)
             has_polo = any("polo" in part for part in detected_parts)
-            has_dress = any("dress" in part for part in detected_parts)
-            has_pants = any("pants" in part or "pant" in part for part in detected_parts)
             
-            # Determine gender based on distinctive items
-            if has_ribbon or has_dress:
+            if has_ribbon or has_brown_dress:
                 is_female = True
-            elif has_polo or has_pants:
+            elif has_polo or has_brown_pants:
                 is_female = False
             else:
-                # Count indicators as fallback
-                female_count = sum(1 for indicator in female_indicators 
-                                  if any(indicator in part or part in indicator for part in detected_parts))
-                male_count = sum(1 for indicator in male_indicators 
-                                if any(indicator in part or part in indicator for part in detected_parts))
-                
-                if female_count > male_count:
-                    is_female = True
-                elif male_count > female_count:
-                    is_female = False
-                else:
-                    return False  # Cannot determine gender
+                return False
             
             # Set required parts based on gender
             if is_female:
@@ -308,14 +329,14 @@ class AttendanceSystem:
                     "ribbon": ["ribbon"],
                     "black shoes": ["black_shoes", "shoes", "black shoes"],
                     "school id": ["school_id", "id", "school id"],
-                    "dress": ["dress", "brown dress", "brown_dress"],
+                    "dress": ["brown_dress", "brown dress"],
                     "socks": ["socks"],
                     "belt": ["belt"]
                 }
             else:
                 required_parts = {
                     "white polo": ["polo", "white polo", "white_polo"],
-                    "brown pants": ["pants", "brown pants", "brown_pants", "pant"],
+                    "brown pants": ["brown_pants", "brown pants", "brown_pant"],
                     "socks": ["socks"],
                     "black shoes": ["black_shoes", "shoes", "black shoes"],
                     "school id": ["school_id", "id", "school id"]
@@ -326,8 +347,7 @@ class AttendanceSystem:
             for item_name, variations in required_parts.items():
                 found = False
                 for variation in variations:
-                    if any(variation in detected or detected in variation 
-                           for detected in detected_parts):
+                    if any(detected == variation for detected in detected_parts):
                         found = True
                         break
                 if not found:
@@ -341,7 +361,7 @@ class AttendanceSystem:
                 uniform_status = "Complete"
                 missing_items = "None"
             
-            # Add to queue instead of direct insert - OPTIMIZATION
+            # Add to queue
             self.db_queue.put(("INSERT", (name, uniform_status, missing_items, 
                                           current_time_str, status, current_date)))
             
@@ -376,7 +396,7 @@ class AttendanceSystem:
                   bg=self.accent_color, fg=self.text_light,
                   width=25, height=2, cursor="hand2", border=0, relief=tk.FLAT, 
                   command=self.open_admin).pack(pady=12)
-        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.3", 
+        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.6 Optimized", 
                  font=("Segoe UI", 9),
                  bg=self.bg_primary, fg="#666666").pack(side=tk.BOTTOM, pady=20)
 
@@ -401,6 +421,7 @@ class AttendanceSystem:
                         "Failed to open camera. Please check if camera is in use."))
                     return
                 
+                # Optimized camera settings
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 self.cap.set(cv2.CAP_PROP_FPS, 30)
@@ -419,6 +440,7 @@ class AttendanceSystem:
                 self.current_face_boxes = []
                 self.recognized_faces = {}
                 self.uniform_accumulator = {}
+                self.current_uniform_parts = {}
                 self.root.after(10, self.update_camera)
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to open camera: {e}"))
@@ -513,6 +535,33 @@ class AttendanceSystem:
         self.recognized_faces = new_recognized_faces
         self.recognition_in_progress = False
 
+    def process_uniform_detection(self, frame):
+        """Process uniform detection in background thread"""
+        uniform_parts = {}
+        
+        if self.uniform_model:
+            uniform_results = self.uniform_model(frame, conf=self.UNIFORM_CONFIDENCE, verbose=False)
+            
+            for box in uniform_results[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls = int(box.cls[0])
+                class_name = uniform_results[0].names[cls]
+                
+                should_include = True
+                
+                if "dress" in class_name.lower() or "pants" in class_name.lower() or "pant" in class_name.lower():
+                    is_brown = self.is_brown_color(frame, x1, y1, x2, y2)
+                    if not is_brown:
+                        should_include = False
+                
+                if should_include:
+                    if class_name not in uniform_parts:
+                        uniform_parts[class_name] = []
+                    uniform_parts[class_name].append((x1, y1, x2, y2, float(box.conf[0])))
+        
+        self.current_uniform_parts = uniform_parts
+        self.uniform_detection_in_progress = False
+
     def update_camera(self):
         if not self.camera_active:
             return
@@ -529,19 +578,30 @@ class AttendanceSystem:
             
             self.frame_count += 1
             
-            # Face detection (EVERY FRAME)
+            # Face detection (every frame, but fast)
             if self.face_cascade:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
-                self.current_face_boxes = [(x, y, w, h) for (x, y, w, h) in faces]
+                # Downscale for faster detection
+                scale = 2
+                gray_small = cv2.resize(gray, (gray.shape[1]//scale, gray.shape[0]//scale))
+                faces_small = self.face_cascade.detectMultiScale(gray_small, 1.3, 5)
+                # Scale back up
+                faces = [(x*scale, y*scale, w*scale, h*scale) for (x, y, w, h) in faces_small]
+                self.current_face_boxes = faces
                 
-                # Face recognition (less frequent)
+                # Face recognition (much less frequent)
                 if self.frame_count % self.RECOGNITION_EVERY_N_FRAMES == 0 and len(faces) > 0 and not self.recognition_in_progress:
                     self.recognition_in_progress = True
                     threading.Thread(target=self.process_face_recognition, 
                                    args=(frame.copy(), faces), daemon=True).start()
             
-            # Draw face boxes
+            # Uniform detection (less frequent)
+            if self.frame_count % self.UNIFORM_EVERY_N_FRAMES == 0 and not self.uniform_detection_in_progress:
+                self.uniform_detection_in_progress = True
+                threading.Thread(target=self.process_uniform_detection, 
+                               args=(frame.copy(),), daemon=True).start()
+            
+            # Draw face boxes (from cached data)
             for box in self.current_face_boxes:
                 x, y, w, h = box
                 name = self.get_face_name_for_box(box)
@@ -554,46 +614,73 @@ class AttendanceSystem:
                 cv2.putText(frame, name, (x+5, y-10), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Uniform detection
-            uniform_parts = {}
-            if self.uniform_model:
-                uniform_results = self.uniform_model(frame, conf=self.UNIFORM_CONFIDENCE, verbose=False)
-                
-                for box in uniform_results[0].boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-                    class_name = uniform_results[0].names[cls]
-                    
-                    if class_name not in uniform_parts:
-                        uniform_parts[class_name] = 0
-                    uniform_parts[class_name] += 1
-                    
+            # Draw uniform boxes (from cached data)
+            uniform_counts = {}
+            for class_name, boxes in self.current_uniform_parts.items():
+                uniform_counts[class_name] = len(boxes)
+                for x1, y1, x2, y2, conf in boxes:
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
                     label = f"{class_name} {conf:.2f}"
                     label_width = len(label) * 8 + 10
                     cv2.rectangle(frame, (x1, y1-25), (x1+label_width, y1), (0, 255, 0), -1)
                     cv2.putText(frame, label, (x1+5, y1-8),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Update status
-            num_faces = len(self.current_face_boxes)
-            recognized_names = [name for name in self.recognized_faces.values() 
-                              if name != "Unknown" and name != "Detecting..."]
+            # Update status (throttled)
+            current_time = time.time()
+            if current_time - self.last_ui_update >= self.ui_update_interval:
+                self.last_ui_update = current_time
+                
+                # Process any queued UI updates
+                try:
+                    while not self.ui_update_queue.empty():
+                        update_type, message = self.ui_update_queue.get_nowait()
+                        if update_type == "success":
+                            self.status_label.config(text=message, fg=self.success)
+                except:
+                    pass
+                
+                # Update face status
+                num_faces = len(self.current_face_boxes)
+                recognized_names = [name for name in self.recognized_faces.values() 
+                                  if name != "Unknown" and name != "Detecting..."]
+                
+                if num_faces > 0:
+                    if recognized_names:
+                        self.status_label.config(
+                            text=f"✓ Recognized: {', '.join(set(recognized_names))}", 
+                            fg=self.success
+                        )
+                    else:
+                        self.status_label.config(
+                            text="⚠ Face detected but not recognized", 
+                            fg=self.warning
+                        )
+                else:
+                    self.status_label.config(
+                        text="👁 Scanning for faces...", 
+                        fg=self.text_light
+                    )
+                
+                # Update uniform status
+                if uniform_counts:
+                    parts_text = " | ".join([f"{k}: {v}" for k, v in uniform_counts.items()])
+                    self.missing_label.config(text=f"Uniform parts: {parts_text}", fg=self.success)
+                else:
+                    self.missing_label.config(text="No uniform parts detected", fg=self.warning)
             
-            # Accumulate uniform parts
+            # Accumulate uniform parts for logging
             if recognized_names:
                 for face_name in set(recognized_names):
                     if face_name not in self.uniform_accumulator:
                         self.uniform_accumulator[face_name] = {}
                     
-                    for part, count in uniform_parts.items():
+                    for part, boxes in self.current_uniform_parts.items():
                         if part not in self.uniform_accumulator[face_name]:
                             self.uniform_accumulator[face_name][part] = 0
-                        self.uniform_accumulator[face_name][part] += count
+                        self.uniform_accumulator[face_name][part] += len(boxes)
             
-            # Auto-log (optimized - every 15 frames instead of 30)
+            # Auto-log (less frequent)
             if self.frame_count % self.accumulation_frames == 0 and recognized_names:
                 for face_name in set(recognized_names):
                     current_time = datetime.now()
@@ -613,40 +700,22 @@ class AttendanceSystem:
                             if count >= threshold:
                                 consistent_parts[part] = 1
                         
-                        # Log asynchronously
                         threading.Thread(target=self.log_attendance, 
                                        args=(face_name, consistent_parts.copy()), 
                                        daemon=True).start()
                     
                     if face_name in self.uniform_accumulator:
                         self.uniform_accumulator[face_name] = {}
-            
-            # Update UI
-            if num_faces > 0:
-                if recognized_names:
-                    self.status_label.config(
-                        text=f"✓ Recognized: {', '.join(set(recognized_names))}", 
-                        fg=self.success
-                    )
-                else:
-                    self.status_label.config(
-                        text="⚠ Face detected but not recognized", 
-                        fg=self.warning
-                    )
-            else:
-                self.status_label.config(
-                    text="👁 Scanning for faces...", 
-                    fg=self.text_light
-                )
-            
-            if uniform_parts:
-                parts_text = " | ".join([f"{k}: {v}" for k, v in uniform_parts.items()])
-                self.missing_label.config(text=f"Uniform parts: {parts_text}", fg=self.success)
-            else:
-                self.missing_label.config(text="No uniform parts detected", fg=self.warning)
 
-            # Display frame
+            # Display frame (optimized)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Resize if needed for display
+            display_width = 800
+            h, w = frame_rgb.shape[:2]
+            if w > display_width:
+                scale = display_width / w
+                frame_rgb = cv2.resize(frame_rgb, (display_width, int(h * scale)))
+            
             img = ImageTk.PhotoImage(image=Image.fromarray(frame_rgb))
             self.camera_label.config(image=img, text="")
             self.camera_label.image = img
@@ -836,7 +905,7 @@ class AttendanceSystem:
             messagebox.showinfo("Success", f"Records exported successfully to:\n{file_path}")
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export: {e}\n\nMake sure xlsxwriter is installed:\npip install xlsxwriter")
+            messagebox.showerror("Error", f"Failed to export: {e}")
 
     def refresh_admin_table(self):
         for item in self.admin_table.get_children():
@@ -865,7 +934,7 @@ class AttendanceSystem:
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
-        self.db_queue.put(None)  # Stop the DB thread
+        self.db_queue.put(None)
         self.conn.close()
         self.root.destroy()
 
