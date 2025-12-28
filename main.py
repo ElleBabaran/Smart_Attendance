@@ -40,10 +40,20 @@ class AttendanceSystem:
         # Detection configuration
         self.UNIFORM_MODEL_PATH = 'runs/detect/uniform_detector2/weights/best.pt'
         self.UNIFORM_CONFIDENCE = 0.25
+        
+        # Higher confidence thresholds for specific items to reduce false positives
+        self.ITEM_CONFIDENCE_THRESHOLDS = {
+            'ribbon': 0.45,
+            'socks': 0.40,
+            'black_shoes': 0.40,
+            'shoes': 0.40,
+            'default': 0.25
+        }
+        
         self.FACE_EMBEDDINGS_PATH = "face_embeddings.pkl"
         self.FACE_THRESHOLD = 10
-        self.RECOGNITION_EVERY_N_FRAMES = 30  # Reduced frequency
-        self.UNIFORM_EVERY_N_FRAMES = 3  # Process uniform detection less often
+        self.RECOGNITION_EVERY_N_FRAMES = 30
+        self.UNIFORM_EVERY_N_FRAMES = 3
         
         # Detection variables
         self.face_embeddings = {}
@@ -68,17 +78,22 @@ class AttendanceSystem:
         # Uniform accumulation
         self.uniform_accumulator = {}
         self.accumulation_frames = 15
-        self.current_uniform_parts = {}  # Cache for display
+        self.current_uniform_parts = {}
         
         # Database queue for async operations
         self.db_queue = Queue()
         self.db_thread = threading.Thread(target=self.process_db_queue, daemon=True)
         self.db_thread.start()
         
-        # UI update queue - prevent UI flooding
+        # UI update queue
         self.ui_update_queue = Queue(maxsize=1)
         self.last_ui_update = 0
-        self.ui_update_interval = 0.1  # Update UI max 10 times per second
+        self.ui_update_interval = 0.1
+        
+        # Auto-absent checking
+        self.absent_check_done_today = False
+        self.absent_check_thread = None
+        self.start_absent_checker()
 
         # Database initialization
         self.init_database()
@@ -134,6 +149,88 @@ class AttendanceSystem:
         
         self.conn.commit()
 
+    def start_absent_checker(self):
+        """Start background thread to check for absent students after 3:30 PM"""
+        def check_absent_periodically():
+            while True:
+                try:
+                    current_time = datetime.now()
+                    current_date = current_time.strftime("%B %d, %Y")
+                    
+                    # Check if it's past 3:30 PM (15:30)
+                    if current_time.hour >= 15 and current_time.minute >= 30:
+                        # Check if we haven't done the absent check today
+                        if not self.absent_check_done_today:
+                            self.mark_absent_students()
+                            self.absent_check_done_today = True
+                    else:
+                        # Reset flag for next day if it's before 3:30 PM
+                        if current_time.hour < 15:
+                            self.absent_check_done_today = False
+                    
+                    # Check every 5 minutes
+                    time.sleep(300)
+                    
+                except Exception as e:
+                    print(f"Absent checker error: {e}")
+                    time.sleep(300)
+        
+        self.absent_check_thread = threading.Thread(target=check_absent_periodically, daemon=True)
+        self.absent_check_thread.start()
+
+    def mark_absent_students(self):
+        """Mark all registered students who haven't been detected today as absent"""
+        try:
+            current_date = datetime.now().strftime("%B %d, %Y")
+            current_time = datetime.now().strftime("%I:%M %p")
+            
+            # Get all registered students from face embeddings
+            if not self.face_embeddings:
+                if os.path.exists(self.FACE_EMBEDDINGS_PATH):
+                    with open(self.FACE_EMBEDDINGS_PATH, 'rb') as f:
+                        self.face_embeddings = pickle.load(f)
+            
+            if not self.face_embeddings:
+                print("No registered students found")
+                return
+            
+            # Get list of students who already have attendance today
+            conn = sqlite3.connect('attendance.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT full_name FROM attendance WHERE date = ?", (current_date,))
+            present_students = set(row[0] for row in cursor.fetchall())
+            
+            # Find students who are not in today's attendance
+            absent_students = set(self.face_embeddings.keys()) - present_students
+            
+            # Mark them as absent
+            absent_count = 0
+            for student_name in absent_students:
+                cursor.execute('''INSERT INTO attendance 
+                    (full_name, uniform_status, missing_items, time, status, date)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (student_name, "Not Detected", "Student was absent", current_time, "Absent", current_date))
+                absent_count += 1
+            
+            conn.commit()
+            conn.close()
+            
+            if absent_count > 0:
+                print(f"Marked {absent_count} students as absent for {current_date}")
+                # Schedule UI notification if in admin panel
+                self.schedule_ui_update("info", f"✓ Auto-marked {absent_count} students as absent")
+            
+        except Exception as e:
+            print(f"Error marking absent students: {e}")
+
+    def get_confidence_threshold(self, class_name):
+        """Get the confidence threshold for a specific item"""
+        class_lower = class_name.lower()
+        for item, threshold in self.ITEM_CONFIDENCE_THRESHOLDS.items():
+            if item in class_lower:
+                return threshold
+        return self.ITEM_CONFIDENCE_THRESHOLDS['default']
+
     def process_db_queue(self):
         """Background thread to process database operations asynchronously"""
         while True:
@@ -171,7 +268,7 @@ class AttendanceSystem:
         try:
             self.ui_update_queue.put((update_type, message), block=False)
         except:
-            pass  # Queue full, skip this update
+            pass
 
     def load_models(self):
         """Load face recognition and uniform detection models"""
@@ -225,7 +322,6 @@ class AttendanceSystem:
             if roi.size == 0:
                 return False
             
-            # Downsample for faster processing
             roi_small = cv2.resize(roi, (50, 50))
             hsv = cv2.cvtColor(roi_small, cv2.COLOR_BGR2HSV)
             
@@ -396,15 +492,39 @@ class AttendanceSystem:
                   bg=self.accent_color, fg=self.text_light,
                   width=25, height=2, cursor="hand2", border=0, relief=tk.FLAT, 
                   command=self.open_admin).pack(pady=12)
-        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.6 Optimized", 
+        tk.Button(main_frame, text="MARK ABSENT NOW", font=button_font, 
+                  bg=self.highlight, fg=self.text_light,
+                  width=25, height=2, cursor="hand2", border=0, relief=tk.FLAT, 
+                  command=self.manual_absent_check).pack(pady=12)
+        tk.Label(main_frame, text="Powered by DeepFace & YOLO • v2.8 Auto-Absent", 
                  font=("Segoe UI", 9),
                  bg=self.bg_primary, fg="#666666").pack(side=tk.BOTTOM, pady=20)
+
+    def manual_absent_check(self):
+        """Manually trigger absent student marking"""
+        confirm = messagebox.askyesno("Confirm", 
+            "This will mark all undetected registered students as absent for today. Continue?")
+        if confirm:
+            threading.Thread(target=self._do_manual_absent_check, daemon=True).start()
+    
+    def _do_manual_absent_check(self):
+        """Perform manual absent check in background"""
+        try:
+            self.mark_absent_students()
+            self.root.after(0, lambda: messagebox.showinfo("Success", 
+                "Absent students have been marked in the database."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", 
+                f"Failed to mark absent students: {e}"))
 
     def start_camera(self):
         if self.cap:
             self.cap.release()
             self.cap = None
-            cv2.destroyAllWindows()
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass
         
         self.open_camera_window()
         
@@ -536,7 +656,7 @@ class AttendanceSystem:
         self.recognition_in_progress = False
 
     def process_uniform_detection(self, frame):
-        """Process uniform detection in background thread"""
+        """Process uniform detection in background thread with item-specific thresholds"""
         uniform_parts = {}
         
         if self.uniform_model:
@@ -546,6 +666,14 @@ class AttendanceSystem:
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cls = int(box.cls[0])
                 class_name = uniform_results[0].names[cls]
+                confidence = float(box.conf[0])
+                
+                # Get item-specific confidence threshold
+                required_confidence = self.get_confidence_threshold(class_name)
+                
+                # Skip if confidence is below item-specific threshold
+                if confidence < required_confidence:
+                    continue
                 
                 should_include = True
                 
@@ -557,7 +685,7 @@ class AttendanceSystem:
                 if should_include:
                     if class_name not in uniform_parts:
                         uniform_parts[class_name] = []
-                    uniform_parts[class_name].append((x1, y1, x2, y2, float(box.conf[0])))
+                    uniform_parts[class_name].append((x1, y1, x2, y2, confidence))
         
         self.current_uniform_parts = uniform_parts
         self.uniform_detection_in_progress = False
@@ -581,27 +709,22 @@ class AttendanceSystem:
             # Face detection (every frame, but fast)
             if self.face_cascade:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Downscale for faster detection
                 scale = 2
                 gray_small = cv2.resize(gray, (gray.shape[1]//scale, gray.shape[0]//scale))
                 faces_small = self.face_cascade.detectMultiScale(gray_small, 1.3, 5)
-                # Scale back up
                 faces = [(x*scale, y*scale, w*scale, h*scale) for (x, y, w, h) in faces_small]
                 self.current_face_boxes = faces
                 
-                # Face recognition (much less frequent)
                 if self.frame_count % self.RECOGNITION_EVERY_N_FRAMES == 0 and len(faces) > 0 and not self.recognition_in_progress:
                     self.recognition_in_progress = True
                     threading.Thread(target=self.process_face_recognition, 
                                    args=(frame.copy(), faces), daemon=True).start()
             
-            # Uniform detection (less frequent)
             if self.frame_count % self.UNIFORM_EVERY_N_FRAMES == 0 and not self.uniform_detection_in_progress:
                 self.uniform_detection_in_progress = True
                 threading.Thread(target=self.process_uniform_detection, 
                                args=(frame.copy(),), daemon=True).start()
             
-            # Draw face boxes (from cached data)
             for box in self.current_face_boxes:
                 x, y, w, h = box
                 name = self.get_face_name_for_box(box)
@@ -614,7 +737,6 @@ class AttendanceSystem:
                 cv2.putText(frame, name, (x+5, y-10), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Draw uniform boxes (from cached data)
             uniform_counts = {}
             for class_name, boxes in self.current_uniform_parts.items():
                 uniform_counts[class_name] = len(boxes)
@@ -626,21 +748,20 @@ class AttendanceSystem:
                     cv2.putText(frame, label, (x1+5, y1-8),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
-            # Update status (throttled)
             current_time = time.time()
             if current_time - self.last_ui_update >= self.ui_update_interval:
                 self.last_ui_update = current_time
                 
-                # Process any queued UI updates
                 try:
                     while not self.ui_update_queue.empty():
                         update_type, message = self.ui_update_queue.get_nowait()
                         if update_type == "success":
                             self.status_label.config(text=message, fg=self.success)
+                        elif update_type == "info":
+                            self.status_label.config(text=message, fg=self.warning)
                 except:
                     pass
                 
-                # Update face status
                 num_faces = len(self.current_face_boxes)
                 recognized_names = [name for name in self.recognized_faces.values() 
                                   if name != "Unknown" and name != "Detecting..."]
@@ -662,14 +783,12 @@ class AttendanceSystem:
                         fg=self.text_light
                     )
                 
-                # Update uniform status
                 if uniform_counts:
                     parts_text = " | ".join([f"{k}: {v}" for k, v in uniform_counts.items()])
                     self.missing_label.config(text=f"Uniform parts: {parts_text}", fg=self.success)
                 else:
                     self.missing_label.config(text="No uniform parts detected", fg=self.warning)
             
-            # Accumulate uniform parts for logging
             if recognized_names:
                 for face_name in set(recognized_names):
                     if face_name not in self.uniform_accumulator:
@@ -680,7 +799,6 @@ class AttendanceSystem:
                             self.uniform_accumulator[face_name][part] = 0
                         self.uniform_accumulator[face_name][part] += len(boxes)
             
-            # Auto-log (less frequent)
             if self.frame_count % self.accumulation_frames == 0 and recognized_names:
                 for face_name in set(recognized_names):
                     current_time = datetime.now()
@@ -707,9 +825,7 @@ class AttendanceSystem:
                     if face_name in self.uniform_accumulator:
                         self.uniform_accumulator[face_name] = {}
 
-            # Display frame (optimized)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            # Resize if needed for display
             display_width = 800
             h, w = frame_rgb.shape[:2]
             if w > display_width:
@@ -734,7 +850,10 @@ class AttendanceSystem:
         if self.cap:
             self.cap.release()
             self.cap = None
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
         self.root.after(100, self.show_main_menu)
 
     def increase_threshold(self):
@@ -931,11 +1050,23 @@ class AttendanceSystem:
 
     def on_closing(self):
         self.camera_active = False
+        
         if self.cap:
             self.cap.release()
-        cv2.destroyAllWindows()
+            self.cap = None
+        
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
+        
         self.db_queue.put(None)
-        self.conn.close()
+        
+        try:
+            self.conn.close()
+        except:
+            pass
+        
         self.root.destroy()
 
 if __name__ == "__main__":
